@@ -1,6 +1,8 @@
 # Expressive Keyboard
 
 <div align="center">
+  <img src="docs/icon.png" width="112" height="112" alt="Expressive Keyboard icon">
+  <br>
   <b>A fully local, privacy-first Android keyboard that's actually nice to use.</b>
   <br>
   Material 3 Expressive design, glide typing, multilingual autocorrect, AI rewrites and voice typing, all running on your phone. Nothing you type or say ever leaves it.
