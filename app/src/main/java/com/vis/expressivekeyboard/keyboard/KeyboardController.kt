@@ -931,12 +931,12 @@ class KeyboardController(private val ime: ExpressiveIME) {
         val left: StripItem?
         var right: StripItem?
         if (emoji != null && auto == null && (res.typedValid || EmojiData.isAlias(typed))) {
-            // Like Gboard: typed word on the left, emoji in the middle, next best on the right.
+            // Like Gboard: next best on the left, typed word in the middle, emoji on the right.
             // Space still commits the literal word since nothing is auto-corrected here.
             return listOfNotNull(
+                others.getOrNull(0)?.let { StripItem(it, StripType.NORMAL) },
                 StripItem(typed, StripType.NORMAL),
                 StripItem(emoji, StripType.EMOJI),
-                others.getOrNull(0)?.let { StripItem(it, StripType.NORMAL) },
             )
         } else if (auto != null) {
             center = StripItem(auto, StripType.AUTO)

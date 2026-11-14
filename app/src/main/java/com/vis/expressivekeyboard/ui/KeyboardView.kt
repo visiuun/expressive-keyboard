@@ -226,15 +226,35 @@ private fun SuggestionRow(controller: KeyboardController) {
     val kc = LocalKeyColors.current
     val view = LocalView.current
     val items = controller.strip
+    // Three fixed slots. Like Gboard, an emoji suggestion always sits in the rightmost slot,
+    // even when there are fewer words (otherwise it would slide into the center).
+    val slots: List<StripItem?> = run {
+        val emoji = items.lastOrNull()?.takeIf { it.type == StripType.EMOJI }
+        if (emoji == null) {
+            items.take(3) + List((3 - items.size).coerceAtLeast(0)) { null }
+        } else {
+            val words = items.dropLast(1).take(2)
+            when (words.size) {
+                0 -> listOf(null, null, emoji)
+                1 -> listOf(null, words[0], emoji)
+                else -> listOf(words[0], words[1], emoji)
+            }
+        }
+    }
     Row(Modifier.fillMaxSize(), verticalAlignment = Alignment.CenterVertically) {
         StripToggle(controller, open = false)
-        items.forEachIndexed { i, item ->
-            if (i > 0) Box(Modifier.width(1.dp).height(20.dp).background(kc.stripText.copy(alpha = 0.15f)))
-            SuggestionCell(item, Modifier.weight(1f).fillMaxHeight(), onClick = {
-                controller.feedback(view, null); controller.pickSuggestion(item)
-            }, onLong = { if (item.type != StripType.LITERAL) controller.blockSuggestion(item) })
+        slots.forEachIndexed { i, item ->
+            if (i > 0 && item != null && slots[i - 1] != null) {
+                Box(Modifier.width(1.dp).height(20.dp).background(kc.stripText.copy(alpha = 0.15f)))
+            }
+            if (item == null) {
+                Spacer(Modifier.weight(1f))
+            } else {
+                SuggestionCell(item, Modifier.weight(1f).fillMaxHeight(), onClick = {
+                    controller.feedback(view, null); controller.pickSuggestion(item)
+                }, onLong = { if (item.type != StripType.LITERAL) controller.blockSuggestion(item) })
+            }
         }
-        if (items.size < 3) repeat(3 - items.size) { Spacer(Modifier.weight(1f)) }
         Box(
             Modifier.padding(end = 6.dp).size(36.dp).clip(CircleShape)
                 .combinedClickable(onClick = { controller.openPanel(Panel.VOICE) }),

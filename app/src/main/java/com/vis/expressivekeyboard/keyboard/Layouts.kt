@@ -72,6 +72,17 @@ object Layouts {
             Mode.ALPHA -> Key(KeyType.SYMBOLS, "?123", width = 1.5f)
             else -> Key(KeyType.ALPHA, "ABC", width = 1.5f)
         }
+        // Gboard's second symbols page (=\<) swaps the comma/period keys for < and >.
+        if (mode == Mode.SYMBOLS2) {
+            return listOf(
+                modeKey,
+                Key(KeyType.CHAR, "<", "<", 1f, listOf("≤", "‹", "«"), functional = true),
+                Key(KeyType.EMOJI, "emoji", width = 1f),
+                Key(KeyType.SPACE, "space", " ", width = 4.0f),
+                Key(KeyType.CHAR, ">", ">", 1f, listOf("≥", "›", "»"), functional = true),
+                Key(KeyType.ENTER, "enter", "\n", width = 1.5f),
+            )
+        }
         val left = when (field) {
             FieldKind.EMAIL -> ch("@", popup = listOf("_", "-", "+"))
             FieldKind.URL -> ch("/", popup = listOf(":", "-", "_", "~"))
