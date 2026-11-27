@@ -112,6 +112,7 @@ fun KeyboardRoot(controller: KeyboardController) {
         val rowH = rowHeight()
         val alphaRows = if (Prefs.numberRow.value) 5 else 4
         val areaH = rowH * alphaRows + 5.dp
+        val searching = controller.panel == Panel.EMOJI_SEARCH
         Column(
             Modifier
                 .fillMaxWidth()
@@ -119,7 +120,7 @@ fun KeyboardRoot(controller: KeyboardController) {
                 .imeBottomPadding(),
         ) {
             TopStrip(controller)
-            Box(Modifier.fillMaxWidth().height(areaH)) {
+            Box(Modifier.fillMaxWidth().height(if (searching) areaH + EMOJI_RESULTS_HEIGHT else areaH)) {
                 val eff = MaterialTheme.motionScheme.fastEffectsSpec<Float>()
                 val spa = MaterialTheme.motionScheme.fastSpatialSpec<Float>()
                 AnimatedContent(
@@ -132,6 +133,10 @@ fun KeyboardRoot(controller: KeyboardController) {
                     when (p) {
                         Panel.KEYS -> OneHandedWrapper(controller) { KeysArea(controller, rowH) }
                         Panel.EMOJI -> EmojiPanel(controller)
+                        Panel.EMOJI_SEARCH -> Column(Modifier.fillMaxSize()) {
+                            EmojiSearchResults(controller)
+                            Box(Modifier.fillMaxWidth().height(areaH)) { KeysArea(controller, rowH) }
+                        }
                         Panel.CLIPBOARD -> ClipboardPanel(controller)
                         Panel.AI -> AiPanel(controller)
                         Panel.VOICE -> VoicePanel(controller)
@@ -171,7 +176,7 @@ private fun OneHandedWrapper(controller: KeyboardController, content: @Composabl
 
 // ============================================================================ top strip
 
-private enum class StripMode { SUGGESTIONS, TOOLBAR, CHIP, CLIP }
+private enum class StripMode { SUGGESTIONS, TOOLBAR, CHIP, CLIP, SEARCH }
 
 @Composable
 fun TopStrip(controller: KeyboardController) {
@@ -180,6 +185,7 @@ fun TopStrip(controller: KeyboardController) {
     val clip = ClipboardStore.freshClip.value
     val clipFresh = (clip != null && System.currentTimeMillis() - clip.time < 120_000) || controller.freshShot != null
     val mode = when {
+        controller.panel == Panel.EMOJI_SEARCH -> StripMode.SEARCH
         controller.panel != Panel.KEYS -> StripMode.TOOLBAR
         composing.isNotEmpty() && controller.strip.isNotEmpty() -> StripMode.SUGGESTIONS
         chip != null -> StripMode.CHIP
@@ -200,6 +206,7 @@ fun TopStrip(controller: KeyboardController) {
                 StripMode.TOOLBAR -> Toolbar(controller)
                 StripMode.CHIP -> AiChipRow(controller)
                 StripMode.CLIP -> ClipRow(controller)
+                StripMode.SEARCH -> EmojiSearchBar(controller)
             }
         }
     }
@@ -250,7 +257,7 @@ private fun SuggestionRow(controller: KeyboardController) {
             if (item == null) {
                 Spacer(Modifier.weight(1f))
             } else {
-                SuggestionCell(item, Modifier.weight(1f).fillMaxHeight(), onClick = {
+                SuggestionCell(item.copy(text = controller.displayText(item)), Modifier.weight(1f).fillMaxHeight(), onClick = {
                     controller.feedback(view, null); controller.pickSuggestion(item)
                 }, onLong = { if (item.type != StripType.LITERAL) controller.blockSuggestion(item) })
             }
@@ -499,7 +506,12 @@ private class Tracker(val id: Long, val start: Offset, var key: KeyRect?) {
     var deleteDrag = false
     var deleteWords = 0
     var repeated = false
+    /** Finger went down on shift and slid onto a letter (types it in upper case, Gboard style). */
+    var fromShift = false
 }
+
+/** Holding shift this long without typing locks caps (LatinIME's long-press shift timeout). */
+private const val SHIFT_LOCK_HOLD_MS = 1200L
 
 class TouchHandler(private val controller: KeyboardController, private val scope: CoroutineScope) {
     var rects: List<KeyRect> = emptyList()
@@ -544,7 +556,7 @@ class TouchHandler(private val controller: KeyboardController, private val scope
         t.longJob?.cancel()
         val k = t.key ?: return
         t.longJob = scope.launch {
-            delay(Prefs.longPressDelay.value.toLong())
+            delay(if (k.key.type == KeyType.SHIFT) SHIFT_LOCK_HOLD_MS else Prefs.longPressDelay.value.toLong())
             when (k.key.type) {
                 KeyType.SHIFT -> { controller.onShiftLongPress(); t.consumed = true }
                 KeyType.SPACE -> { if (!t.spaceDrag) { t.consumed = true; press(k, false); controller.switchKeyboard() } }
@@ -602,6 +614,10 @@ class TouchHandler(private val controller: KeyboardController, private val scope
     }
 
     fun down(id: Long, p: Offset) {
+        // a key pressed while shift is held is chording: shift's long-press (caps lock) no longer applies
+        for (o in trackers.values) {
+            if (o.key?.key?.type == KeyType.SHIFT && !o.fromShift) { o.longJob?.cancel(); controller.onShiftChordKey() }
+        }
         // roll-over typing: commit any pending key from another finger first
         for (o in trackers.values) {
             if (!o.consumed && !o.swiping && !o.spaceDrag && !o.deleteDrag && popup.value?.pointer != o.id) {
@@ -699,7 +715,7 @@ class TouchHandler(private val controller: KeyboardController, private val scope
             return
         }
         val canSwipe = k != null && k.key.isLetter && controller.mode == Mode.ALPHA && Prefs.swipeTyping.value &&
-            controller.field == FieldKind.TEXT && trackers.size == 1
+            controller.keyField == FieldKind.TEXT && (trackers.size == 1 || t.fromShift)
         if (canSwipe && (dx * dx + dy * dy) > (unitW * 0.6f) * (unitW * 0.6f)) {
             t.swiping = true
             t.longJob?.cancel()
@@ -711,6 +727,16 @@ class TouchHandler(private val controller: KeyboardController, private val scope
         }
         t.path += p
         val nk = hit(p)
+        if (nk != null && nk != k && k?.key?.type == KeyType.SHIFT && !t.fromShift && nk.key.isLetter) {
+            // slide from shift onto a letter: that letter is typed shifted, then shift is released
+            t.fromShift = true
+            controller.onShiftChordKey()
+            press(k, false); press(nk, true)
+            t.key = nk
+            if (Prefs.keyPopup.value) preview.value = nk
+            scheduleLong(t)
+            return
+        }
         if (nk != null && nk != k && k?.key?.type != KeyType.SHIFT) {
             press(k, false); press(nk, true)
             t.key = nk
@@ -721,7 +747,14 @@ class TouchHandler(private val controller: KeyboardController, private val scope
 
     fun up(id: Long, p: Offset) {
         val t = trackers.remove(id) ?: return
+        release(t, p)
+        if (t.fromShift) controller.onShiftUp()
+    }
+
+    private fun release(t: Tracker, p: Offset) {
         t.longJob?.cancel(); t.repeatJob?.cancel()
+        if (t.key?.key?.type == KeyType.SHIFT) { press(t.key, false); controller.onShiftUp(); return }
+        val id = t.id
         val k = t.key
         press(k, false)
         if (preview.value == k) preview.value = null
@@ -757,6 +790,7 @@ class TouchHandler(private val controller: KeyboardController, private val scope
     }
 
     fun cancelAll() {
+        if (trackers.values.any { it.fromShift || it.key?.key?.type == KeyType.SHIFT }) controller.onShiftUp()
         trackers.values.forEach { it.longJob?.cancel(); it.repeatJob?.cancel(); press(it.key, false) }
         trackers.clear()
         popup.value = null
@@ -767,8 +801,8 @@ class TouchHandler(private val controller: KeyboardController, private val scope
 
 @Composable
 fun KeysArea(controller: KeyboardController, rowH: Dp) {
-    val rows = remember(controller.mode, controller.field, Prefs.layout.value, Prefs.numberRow.value, Prefs.showHints.value, Prefs.showEmojiKey.value) {
-        Layouts.rows(controller.mode, controller.field, Prefs.layout.value, Prefs.numberRow.value, Prefs.showHints.value).also { Prefs.showEmojiKey.value }
+    val rows = remember(controller.mode, controller.keyField, Prefs.layout.value, Prefs.numberRow.value, Prefs.showHints.value, Prefs.showEmojiKey.value) {
+        Layouts.rows(controller.mode, controller.keyField, Prefs.layout.value, Prefs.numberRow.value, Prefs.showHints.value).also { Prefs.showEmojiKey.value }
     }
     val scope = rememberCoroutineScope()
     val handler = remember(controller) { TouchHandler(controller, scope) }
@@ -951,7 +985,7 @@ private fun KeyLabel(controller: KeyboardController, key: Key, fg: Color, shift:
         )
         KeyType.DELETE -> Icon(Sym.Backspace, "Delete", tint = fg, modifier = Modifier.size(22.dp))
         KeyType.ENTER -> {
-            val icon = if (controller.enterIsNewline) Sym.KeyboardReturn else when (controller.enterAction) {
+            val icon = if (controller.panel == Panel.EMOJI_SEARCH) Sym.Search else if (controller.enterIsNewline) Sym.KeyboardReturn else when (controller.enterAction) {
                 EditorInfo.IME_ACTION_SEARCH -> Sym.Search
                 EditorInfo.IME_ACTION_SEND -> Sym.Send
                 EditorInfo.IME_ACTION_GO, EditorInfo.IME_ACTION_NEXT -> Sym.ArrowForward

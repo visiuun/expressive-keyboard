@@ -36,11 +36,13 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 private val APOS: Char = 39.toChar() // apostrophe
+/** ViewConfiguration's double-tap timeout, which Gboard/LatinIME use for the caps-lock double tap. */
+private const val DOUBLE_TAP_MS = 300L
 private val WORD_RE = Regex("[\\p{L}']+")
 private val WORD_END_RE = Regex("[\\p{L}']+$")
 
 enum class Shift { OFF, ONCE, LOCK }
-enum class Panel { KEYS, EMOJI, CLIPBOARD, AI, VOICE }
+enum class Panel { KEYS, EMOJI, EMOJI_SEARCH, CLIPBOARD, AI, VOICE }
 enum class StripType { NORMAL, AUTO, LITERAL, PREDICTION, AI, EMOJI }
 
 data class StripItem(val text: String, val type: StripType)
@@ -74,6 +76,11 @@ class KeyboardController(private val ime: ExpressiveIME) {
     var aiChip by mutableStateOf<AiChip?>(null)
     var aiPanel by mutableStateOf(AiPanelState())
     var visibleTick by mutableIntStateOf(0)
+    /** Text typed into the emoji panel's search box (Gboard style: the letter keys type here, not into the app). */
+    var emojiQuery by mutableStateOf("")
+    val searchingEmoji get() = panel == Panel.EMOJI_SEARCH
+    /** Field kind the letter keys are laid out for (the emoji search box is always plain text). */
+    val keyField get() = if (searchingEmoji) FieldKind.TEXT else field
 
     private var baseMode = Mode.ALPHA
     /** Gboard rule: once a key has been typed on a symbols page, the next space/enter returns to letters. */
@@ -89,7 +96,14 @@ class KeyboardController(private val ime: ExpressiveIME) {
     private val recentCursors = ArrayDeque<Int>()
     private var lastAutoSpace = false
     private var lastSpaceTime = 0L
-    private var lastShiftTap = 0L
+    // Gboard/LatinIME shift model: pressing shift turns OFF into one-shot shift; releasing a plain tap
+    // turns an already shifted (or caps-locked) keyboard off; a second tap within the double-tap timeout
+    // locks caps; holding shift while typing (chording) capitalises every letter and releasing turns it off.
+    private var lastShiftTapUp = 0L
+    private var shiftHeld = false
+    private var shiftChorded = false
+    private var shiftPressDone = false
+    private var shiftNoTap = false
     private var composingFromGesture = false
     private var gestureAlternatives: List<String> = emptyList()
     private var lastResult: SuggestResult? = null
@@ -336,11 +350,12 @@ class KeyboardController(private val ime: ExpressiveIME) {
     }
 
     private fun inSymbols() = mode == Mode.SYMBOLS || mode == Mode.SYMBOLS2
+    private fun letterMode() = if (searchingEmoji) Mode.ALPHA else baseMode
 
     private fun leaveSymbolsIfTyped() {
         if (inSymbols() && symbolTyped) {
             symbolTyped = false
-            mode = baseMode
+            mode = letterMode()
             updateShift()
         }
     }
@@ -354,7 +369,7 @@ class KeyboardController(private val ime: ExpressiveIME) {
             KeyType.SHIFT -> {}
             KeyType.SYMBOLS, KeyType.NUMPAD_SYMBOLS -> { if (!inSymbols()) symbolTyped = false; mode = Mode.SYMBOLS }
             KeyType.SYMBOLS2 -> { if (!inSymbols()) symbolTyped = false; mode = Mode.SYMBOLS2 }
-            KeyType.ALPHA -> { symbolTyped = false; mode = if (baseMode == Mode.ALPHA) Mode.ALPHA else baseMode; updateShift() }
+            KeyType.ALPHA -> { symbolTyped = false; mode = letterMode(); updateShift() }
             KeyType.EMOJI -> openPanel(Panel.EMOJI)
         }
     }
@@ -373,10 +388,40 @@ class KeyboardController(private val ime: ExpressiveIME) {
     }
 
     fun openPanel(p: Panel) {
+        if (p == Panel.EMOJI) emojiQuery = ""
         if (p == Panel.VOICE) { if (panel == Panel.VOICE) { stopVoice(); panel = Panel.KEYS } else startVoice(); return }
         if (panel == Panel.VOICE) stopVoice()
         if (p != Panel.KEYS) finishComposingQuietly()
         panel = if (panel == p) Panel.KEYS else p
+        if (panel == Panel.KEYS) updateShift()
+    }
+
+    // ------------------------------------------------------------------ emoji search
+
+    /** Opens the search box: the letter keyboard comes back and types into [emojiQuery]. */
+    fun startEmojiSearch() {
+        finishComposingQuietly()
+        symbolTyped = false
+        mode = Mode.ALPHA
+        panel = Panel.EMOJI_SEARCH
+        if (shift != Shift.LOCK) shift = Shift.OFF
+    }
+
+    /** Leaves the search box for the emoji panel; with [keepResults] the panel shows the results grid. */
+    fun endEmojiSearch(keepResults: Boolean) {
+        emojiQuery = if (keepResults) emojiQuery.trim() else ""
+        symbolTyped = false
+        mode = baseMode
+        panel = Panel.EMOJI
+        if (shift != Shift.LOCK) shift = Shift.OFF
+    }
+
+    fun clearEmojiQuery() { emojiQuery = "" }
+
+    private fun searchType(text: String) {
+        emojiQuery = (emojiQuery + text).take(60)
+        oneShotUsed()
+        updateShift()
     }
 
     // ------------------------------------------------------------------ voice typing
@@ -507,27 +552,77 @@ class KeyboardController(private val ime: ExpressiveIME) {
     }
 
     fun onShiftDown() {
-        val now = System.currentTimeMillis()
-        shift = when (shift) {
-            Shift.OFF -> Shift.ONCE
-            Shift.ONCE -> if (now - lastShiftTap < 350) Shift.LOCK else Shift.OFF
-            Shift.LOCK -> Shift.OFF
+        val now = android.os.SystemClock.uptimeMillis()
+        shiftHeld = true
+        shiftChorded = false
+        shiftNoTap = false
+        if (now - lastShiftTapUp < DOUBLE_TAP_MS && shift != Shift.LOCK) {
+            // double tap: caps lock
+            shift = Shift.LOCK
+            shiftPressDone = true
+            shiftNoTap = true
+            lastShiftTapUp = 0
+            return
         }
-        lastShiftTap = now
+        if (shift == Shift.OFF) { shift = Shift.ONCE; shiftPressDone = true } else shiftPressDone = false
     }
 
-    fun onShiftLongPress() { shift = Shift.LOCK }
+    fun onShiftUp() {
+        if (!shiftHeld) return
+        shiftHeld = false
+        val now = android.os.SystemClock.uptimeMillis()
+        when {
+            shiftChorded -> {
+                // shift was held while typing: back to lower case (caps lock survives)
+                lastShiftTapUp = 0
+                if (shift != Shift.LOCK) { shift = Shift.OFF; updateShift() }
+            }
+            shiftNoTap -> lastShiftTapUp = 0
+            else -> {
+                if (!shiftPressDone) shift = Shift.OFF // tap on a shifted / caps-locked keyboard
+                lastShiftTapUp = now
+            }
+        }
+        shiftChorded = false
+    }
+
+    /** Holding shift (without typing anything) locks caps, like LatinIME's long-press shift. */
+    fun onShiftLongPress() {
+        if (!shiftHeld || shiftChorded) return
+        shift = Shift.LOCK
+        shiftNoTap = true
+    }
+
+    /** Another key went down while shift is held: that's chording, not a tap or a long-press. */
+    fun onShiftChordKey() { if (shiftHeld) shiftChorded = true }
+
+    /** Input has used up a one-shot shift; while shift is held (chording) it stays on until release. */
+    private fun oneShotUsed() {
+        if (shiftHeld) { shiftChorded = true; return }
+        if (shift == Shift.ONCE) shift = Shift.OFF
+    }
+
+    /** Text shown (and committed) for a strip item: upper case with caps lock, capitalised with shift. */
+    fun displayText(item: StripItem): String {
+        if (item.type == StripType.EMOJI) return item.text
+        return when {
+            shift == Shift.LOCK -> item.text.uppercase()
+            shift == Shift.ONCE && composing.isEmpty() -> item.text.replaceFirstChar { it.uppercaseChar() }
+            else -> item.text
+        }
+    }
 
     private fun isWordChar(ch: Char): Boolean =
         ch.isLetter() || (composing.isNotEmpty() && (ch == '\'' || ch == '’' || ch.isDigit() || ch == '-' && false))
 
     fun onText(text: String) {
+        if (searchingEmoji) { if (text.isNotEmpty()) searchType(text); return }
         val conn = ic ?: return
         lastCorrection = null
         if (text.isEmpty()) return
         if (!suggestionsAllowed) {
             conn.commitText(text, 1); cursor += text.length; mark()
-            if (shift == Shift.ONCE) shift = Shift.OFF
+            oneShotUsed()
             updateShift()
             return
         }
@@ -542,7 +637,7 @@ class KeyboardController(private val ime: ExpressiveIME) {
             composingText = composing.toString()
             setComposing(composing)
             lastAutoSpace = false
-            if (shift == Shift.ONCE) shift = Shift.OFF
+            oneShotUsed()
             refreshSuggestions()
             return
         }
@@ -568,7 +663,7 @@ class KeyboardController(private val ime: ExpressiveIME) {
         if (swapped && spaceAfter) { commit(" "); lastAutoSpace = true }
         conn.endBatchEdit()
         lastCorrection = correction
-        if (shift == Shift.ONCE && !sep[0].isLetter()) shift = Shift.OFF
+        oneShotUsed()
         updateShift()
         refreshSuggestions()
         if (swapped && sep in listOf(".", "!", "?")) maybeAutoFixSentence()
@@ -603,6 +698,7 @@ class KeyboardController(private val ime: ExpressiveIME) {
     }
 
     fun onSpace() {
+        if (searchingEmoji) { if (emojiQuery.isNotEmpty() && !emojiQuery.endsWith(" ")) searchType(" "); return }
         val conn = ic ?: return
         val now = System.currentTimeMillis()
         conn.beginBatchEdit()
@@ -634,6 +730,7 @@ class KeyboardController(private val ime: ExpressiveIME) {
     }
 
     fun onEnter() {
+        if (searchingEmoji) { endEmojiSearch(keepResults = true); return }
         val conn = ic ?: return
         if (composing.isNotEmpty()) {
             conn.beginBatchEdit(); commitWord(autocorrect = true); conn.endBatchEdit()
@@ -642,6 +739,11 @@ class KeyboardController(private val ime: ExpressiveIME) {
         lastAutoSpace = false
         if (!enterIsNewline) {
             conn.performEditorAction(enterAction)
+            // like Gboard, an editor action (send / go / search ...) brings the letters back;
+            // the editor usually clears or restarts the field, which re-evaluates auto-caps
+            symbolTyped = false
+            if (inSymbols()) mode = baseMode
+            resync = true
         } else {
             ime.sendKeyChar('\n')
             cursor += 1; mark()
@@ -652,6 +754,12 @@ class KeyboardController(private val ime: ExpressiveIME) {
 
     /** Backspace. [repeat] is true for auto-repeat while held. */
     fun onDelete(repeat: Boolean = false) {
+        if (searchingEmoji) {
+            val q = emojiQuery
+            if (q.isNotEmpty()) emojiQuery = q.substring(0, q.length - Character.charCount(Character.codePointBefore(q, q.length)))
+            updateShift()
+            return
+        }
         val conn = ic ?: return
         if (repeat) deleteRepeats++ else deleteRepeats = 0
         val lc = lastCorrection
@@ -702,6 +810,7 @@ class KeyboardController(private val ime: ExpressiveIME) {
     private var deleteSelWords = 0
 
     fun deleteSwipeSelect(words: Int) {
+        if (searchingEmoji) return
         val conn = ic ?: return
         if (deleteSelAnchor < 0) {
             finishComposingQuietly()
@@ -757,7 +866,7 @@ class KeyboardController(private val ime: ExpressiveIME) {
     }
 
     fun moveCursor(steps: Int) {
-        if (steps == 0) return
+        if (steps == 0 || searchingEmoji) return
         finishComposingQuietly()
         resync = true
         val code = if (steps > 0) KeyEvent.KEYCODE_DPAD_RIGHT else KeyEvent.KEYCODE_DPAD_LEFT
@@ -767,8 +876,13 @@ class KeyboardController(private val ime: ExpressiveIME) {
     // ------------------------------------------------------------------ suggestions
 
     fun onGesture(words: List<String>) {
-        val conn = ic ?: return
         if (words.isEmpty()) return
+        if (searchingEmoji) {
+            val sep = if (emojiQuery.isNotEmpty() && !emojiQuery.endsWith(" ")) " " else ""
+            searchType(sep + words[0])
+            return
+        }
+        val conn = ic ?: return
         lastCorrection = null
         conn.beginBatchEdit()
         if (composing.isNotEmpty()) {
@@ -791,13 +905,13 @@ class KeyboardController(private val ime: ExpressiveIME) {
         composingFromGesture = true
         gestureAlternatives = list
         lastAutoSpace = false
-        if (shift == Shift.ONCE) shift = Shift.OFF
+        oneShotUsed()
         refreshSuggestions()
     }
 
-    fun pickSuggestion(item: StripItem) {
+    fun pickSuggestion(original: StripItem) {
         val conn = ic ?: return
-        val typed = composing.toString()
+        val item = original.copy(text = displayText(original))
         val (prev, start) = context(excludeComposing = true)
         conn.beginBatchEdit()
         when (item.type) {
@@ -822,8 +936,8 @@ class KeyboardController(private val ime: ExpressiveIME) {
         composingFromGesture = false
         lastCorrection = null
         if (Prefs.learnWords.value && field == FieldKind.TEXT && item.type != StripType.EMOJI) {
-            if (item.type == StripType.LITERAL || !Dictionary.isValid(item.text)) UserDictionary.learnWord(item.text, 2)
-            UserDictionary.learnBigram(if (start) "<s>" else prev ?: "", item.text)
+            if (original.type == StripType.LITERAL || !Dictionary.isValid(original.text)) UserDictionary.learnWord(original.text, 2)
+            UserDictionary.learnBigram(if (start) "<s>" else prev ?: "", original.text)
         }
         updateShift()
         refreshSuggestions()
@@ -864,8 +978,9 @@ class KeyboardController(private val ime: ExpressiveIME) {
     }
 
     fun updateShift() {
-        if (shift == Shift.LOCK) return
-        if (composing.isNotEmpty()) { if (shift == Shift.ONCE && composing.length > 0) shift = Shift.OFF; return }
+        if (shift == Shift.LOCK || shiftHeld) return
+        if (searchingEmoji) { shift = Shift.OFF; return }
+        if (composing.isNotEmpty()) { if (shift == Shift.ONCE) shift = Shift.OFF; return }
         val auto = Prefs.autoCap.value && mode == Mode.ALPHA && field == FieldKind.TEXT && capsActive()
         shift = if (auto) Shift.ONCE else Shift.OFF
     }
@@ -888,6 +1003,11 @@ class KeyboardController(private val ime: ExpressiveIME) {
         }
         val cx = context(excludeComposing = true)
         val start = cx.sentenceStart
+        if (typed.isEmpty() && textBefore(1).isEmpty() && (ic?.getTextAfterCursor(1, 0)?.isEmpty() != false)) {
+            lastResult = null
+            strip = emptyList()
+            return
+        }
         suggestJob = scope.launch {
             if (typed.isEmpty()) {
                 lastResult = null

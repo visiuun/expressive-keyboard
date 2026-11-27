@@ -3,6 +3,7 @@ package com.vis.expressivekeyboard.ui
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -162,7 +163,30 @@ fun EmojiPanel(controller: KeyboardController) {
         }
     }
 
+    val query = controller.emojiQuery
+    val results = remember(groups, query) { if (query.isBlank()) emptyList() else EmojiData.searchPanel(query) }
+
     Column(Modifier.fillMaxSize()) {
+        EmojiSearchPill(controller, query)
+        if (query.isNotBlank()) {
+            Box(Modifier.weight(1f).fillMaxWidth()) {
+                if (results.isEmpty()) {
+                    Text("No emoji found", color = kc.stripText.copy(alpha = 0.7f), modifier = Modifier.align(Alignment.Center))
+                } else {
+                    LazyVerticalGrid(columns = GridCells.Adaptive(46.dp), modifier = Modifier.fillMaxSize().padding(horizontal = 4.dp)) {
+                        items(results.size, key = { "s_${results[it].value}" }) { i ->
+                            val e = results[i]
+                            EmojiCell(e.value, hasTones = e.tones.isNotEmpty(),
+                                onClick = { controller.feedback(view, null); controller.commitEmoji(e.value) },
+                                onLong = { if (e.tones.isNotEmpty()) toneFor = e })
+                        }
+                    }
+                }
+                TonePicker(controller, toneFor) { toneFor = null }
+            }
+            PanelBottomBar(controller)
+            return@Column
+        }
         // category tabs
         Row(
             Modifier.fillMaxWidth().height(44.dp).padding(horizontal = 4.dp),
@@ -216,28 +240,133 @@ fun EmojiPanel(controller: KeyboardController) {
                     }
                 }
             }
-            // skin-tone picker
-            androidx.compose.animation.AnimatedVisibility(toneFor != null, enter = fadeIn(), exit = fadeOut(), modifier = Modifier.align(Alignment.TopCenter)) {
-                val e = toneFor
-                if (e != null) {
-                    Row(
-                        Modifier.padding(8.dp).clip(RoundedCornerShape(24.dp)).background(kc.popup).padding(6.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        (listOf(e.value) + e.tones).forEach { t ->
-                            Box(
-                                Modifier.size(44.dp).clip(CircleShape).combinedClickable(onClick = {
-                                    controller.commitEmoji(t); toneFor = null
-                                }),
-                                contentAlignment = Alignment.Center,
-                            ) { Text(t, fontSize = 26.sp) }
-                        }
-                        IconButton(onClick = { toneFor = null }) { Icon(Sym.Close, "Close", tint = kc.popupText) }
-                    }
+            TonePicker(controller, toneFor) { toneFor = null }
+        }
+        PanelBottomBar(controller)
+    }
+}
+
+/** Skin-tone picker shown over the emoji grid. */
+@Composable
+private fun androidx.compose.foundation.layout.BoxScope.TonePicker(controller: KeyboardController, toneFor: Emoji?, onDone: () -> Unit) {
+    val kc = LocalKeyColors.current
+    androidx.compose.animation.AnimatedVisibility(toneFor != null, enter = fadeIn(), exit = fadeOut(), modifier = Modifier.align(Alignment.TopCenter)) {
+        val e = toneFor
+        if (e != null) {
+            Row(
+                Modifier.padding(8.dp).clip(RoundedCornerShape(24.dp)).background(kc.popup).padding(6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                (listOf(e.value) + e.tones).forEach { t ->
+                    Box(
+                        Modifier.size(44.dp).clip(CircleShape).combinedClickable(onClick = {
+                            controller.commitEmoji(t); onDone()
+                        }),
+                        contentAlignment = Alignment.Center,
+                    ) { Text(t, fontSize = 26.sp) }
+                }
+                IconButton(onClick = onDone) { Icon(Sym.Close, "Close", tint = kc.popupText) }
+            }
+        }
+    }
+}
+
+/** "Search emoji" box at the top of the emoji panel; tapping it brings up the letter keys. */
+@Composable
+private fun EmojiSearchPill(controller: KeyboardController, query: String) {
+    val kc = LocalKeyColors.current
+    val cs = MaterialTheme.colorScheme
+    Row(
+        Modifier.fillMaxWidth().height(44.dp).padding(start = 8.dp, end = 8.dp, top = 6.dp, bottom = 2.dp)
+            .clip(RoundedCornerShape(20.dp)).background(cs.surfaceContainerHighest)
+            .combinedClickable(onClick = { controller.startEmojiSearch() })
+            .padding(start = 12.dp, end = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(Sym.Search, null, tint = cs.onSurfaceVariant, modifier = Modifier.size(18.dp))
+        Spacer(Modifier.width(8.dp))
+        Text(
+            query.ifEmpty { "Search emoji" }, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 15.sp,
+            color = if (query.isEmpty()) kc.stripText.copy(alpha = 0.6f) else cs.onSurface, modifier = Modifier.weight(1f),
+        )
+        if (query.isNotEmpty()) {
+            IconButton(onClick = { controller.clearEmojiQuery() }, modifier = Modifier.size(32.dp)) {
+                Icon(Sym.Close, "Clear search", tint = cs.onSurfaceVariant, modifier = Modifier.size(18.dp))
+            }
+        }
+    }
+}
+
+val EMOJI_RESULTS_HEIGHT = 52.dp
+
+/** Search box shown in the top strip while the letter keys type into the emoji search. */
+@Composable
+fun EmojiSearchBar(controller: KeyboardController) {
+    val kc = LocalKeyColors.current
+    val cs = MaterialTheme.colorScheme
+    val query = controller.emojiQuery
+    val blink = androidx.compose.animation.core.rememberInfiniteTransition(label = "caret")
+    val caret by blink.animateFloat(
+        1f, 0f,
+        androidx.compose.animation.core.infiniteRepeatable(androidx.compose.animation.core.tween(530, easing = { if (it < 0.5f) 0f else 1f }), androidx.compose.animation.core.RepeatMode.Reverse),
+        label = "caretA",
+    )
+    Row(Modifier.fillMaxSize().padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+        IconButton(onClick = { controller.endEmojiSearch(keepResults = false) }) {
+            Icon(Sym.ArrowBack, "Back to emoji", tint = kc.stripText)
+        }
+        Row(
+            Modifier.weight(1f).height(38.dp).clip(RoundedCornerShape(19.dp)).background(cs.surfaceContainerHighest).padding(start = 12.dp, end = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(Sym.Search, null, tint = cs.onSurfaceVariant, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(8.dp))
+            Box(Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (query.isNotEmpty()) Text(query, color = cs.onSurface, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+                    Box(Modifier.width(2.dp).height(18.dp).background(cs.primary.copy(alpha = caret)))
+                    if (query.isEmpty()) Text("Search emoji", color = kc.stripText.copy(alpha = 0.6f), fontSize = 15.sp, modifier = Modifier.padding(start = 2.dp))
+                }
+            }
+            if (query.isNotEmpty()) {
+                IconButton(onClick = { controller.clearEmojiQuery() }, modifier = Modifier.size(32.dp)) {
+                    Icon(Sym.Close, "Clear search", tint = cs.onSurfaceVariant, modifier = Modifier.size(18.dp))
                 }
             }
         }
-        PanelBottomBar(controller)
+        Spacer(Modifier.width(4.dp))
+    }
+}
+
+/** Live results row above the letter keys while searching (recents while the box is empty). */
+@Composable
+fun EmojiSearchResults(controller: KeyboardController) {
+    val kc = LocalKeyColors.current
+    val view = LocalView.current
+    val query = controller.emojiQuery
+    val groups = EmojiData.groups.value
+    val results = remember(groups, query) {
+        if (query.isBlank()) EmojiData.recents.toList() else EmojiData.searchPanel(query, 60).map { it.value }
+    }
+    val listState = androidx.compose.foundation.lazy.rememberLazyListState()
+    androidx.compose.runtime.LaunchedEffect(query) { listState.scrollToItem(0) }
+    Box(Modifier.fillMaxWidth().height(EMOJI_RESULTS_HEIGHT), contentAlignment = Alignment.CenterStart) {
+        if (results.isEmpty()) {
+            Text(
+                if (query.isBlank()) "Type to search emoji" else "No emoji found",
+                color = kc.stripText.copy(alpha = 0.6f), fontSize = 14.sp, modifier = Modifier.padding(start = 16.dp),
+            )
+        } else {
+            androidx.compose.foundation.lazy.LazyRow(state = listState, modifier = Modifier.fillMaxSize(), contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 6.dp)) {
+                items(results.size, key = { "q_${results[it]}_$it" }) { i ->
+                    Box(
+                        Modifier.size(EMOJI_RESULTS_HEIGHT).padding(3.dp).clip(RoundedCornerShape(12.dp))
+                            .combinedClickable(onClick = { controller.feedback(view, null); controller.commitEmoji(results[i]) }),
+                        contentAlignment = Alignment.Center,
+                    ) { Text(results[i], fontSize = 27.sp) }
+                }
+            }
+        }
     }
 }
 

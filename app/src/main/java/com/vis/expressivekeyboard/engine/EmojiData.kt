@@ -6,7 +6,10 @@ import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import kotlin.concurrent.thread
 
-data class Emoji(val value: String, val name: String, val tones: List<String>)
+data class Emoji(val value: String, val name: String, val tones: List<String>, val keywords: List<String> = emptyList()) {
+    /** Words of the official name, lower-case ("face with tears of joy"). */
+    val nameWords: List<String> = name.lowercase().split(' ', '-', ':', ',').filter { it.isNotEmpty() }
+}
 data class EmojiGroup(val name: String, val emojis: List<Emoji>)
 
 object EmojiData {
@@ -32,7 +35,8 @@ object EmojiData {
                         val p = line.split('\t')
                         if (p.size >= 2 && paint.hasGlyph(p[0])) {
                             val tones = p.getOrNull(2)?.split(',')?.filter { it.isNotEmpty() && paint.hasGlyph(it) } ?: emptyList()
-                            list += Emoji(p[0], p[1], tones)
+                            val kw = p.getOrNull(3)?.split('|')?.filter { it.isNotEmpty() } ?: emptyList()
+                            list += Emoji(p[0], p[1], tones, kw)
                         }
                     }
                 }
@@ -63,10 +67,45 @@ object EmojiData {
             ql.removeSuffix("y") + "ies", ql.removeSuffix("y") + "ied")
         for (pass in 0..1) for (e in all) {
             if (out.size >= max) return out.toList()
-            val words = e.name.split(' ', '-', ':')
-            if (if (pass == 0) ql in words else words.any { it in forms }) out += e.value
+            val words = e.nameWords
+            if (if (pass == 0) ql in words || ql in e.keywords else words.any { it in forms }) out += e.value
         }
         return out.take(max)
+    }
+
+    /**
+     * Search used by the emoji panel's search box (Gboard style): matches as you type, from the first
+     * letter, against the emoji's name and its CLDR keywords ("lol" -> 😂, "cel" -> 🎉). Every word
+     * of the query has to match; results are ranked by how well they match.
+     */
+    fun searchPanel(q: String, max: Int = 120): List<Emoji> {
+        val tokens = q.lowercase().trim().split(' ', '\t', '\n').filter { it.isNotEmpty() }
+        if (tokens.isEmpty()) return emptyList()
+        val all = groups.value.flatMap { it.emojis }
+        val alias = if (tokens.size == 1) ALIASES[tokens[0]] else null
+        val joined = tokens.joinToString(" ")
+        val scored = ArrayList<Pair<Emoji, Int>>()
+        all.forEachIndexed { i, e ->
+            var score = 0
+            for (t in tokens) {
+                val s = when {
+                    t in e.nameWords -> 60
+                    t in e.keywords -> 45
+                    e.nameWords.any { it.startsWith(t) } -> 30
+                    e.keywords.any { k -> k.startsWith(t) || k.split(' ').any { it.startsWith(t) } } -> 20
+                    else -> 0
+                }
+                if (s == 0) { score = 0; break }
+                score += s
+            }
+            if (score == 0) return@forEachIndexed
+            val name = e.name.lowercase()
+            if (name == joined) score += 100 else if (name.startsWith(joined)) score += 25
+            if (e.value == alias) score += 1000
+            // fewer name words = more "canonical" (cat > cat with wry smile); earlier groups first on ties
+            scored += e to (score * 10_000 - e.nameWords.size * 100 - i / 100)
+        }
+        return scored.sortedByDescending { it.second }.map { it.first }.take(max)
     }
 
     fun isAlias(q: String) = q.lowercase() in ALIASES
